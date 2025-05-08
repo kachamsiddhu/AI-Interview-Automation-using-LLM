@@ -1,0 +1,173 @@
+import time
+
+from model import infer_with_retry
+from nltk.translate.bleu_score import sentence_bleu  # Import BLEU score
+
+def calculate_relevance_score(question, answer, resume_context=""):
+    """
+    Calculate how relevant an answer is to the question asked.
+    Args:
+        question (str): The interview question
+        answer (str): The candidate's answer
+        resume_context (str): Optional resume text for additional context
+    Returns:
+        dict: Dictionary containing score and feedback
+    """
+
+    system_prompt = """
+    You are an expert interview evaluator. Your task is to evaluate how relevant a candidate's answer
+    is to the interview question asked. Consider:
+    1. Directness: Does the answer address the question directly?
+    2. Completeness: Does the answer cover all aspects of the question?
+    3. Specificity: Does the answer provide specific examples rather than generic statements?
+    4. Relevance: Does the answer stay on topic or drift to unrelated areas?
+    5. Technical accuracy: For technical questions, is the answer technically sound?
+    Provide a relevance score from 0-100 and brief feedback.
+    """
+
+    resume_snippet = resume_context[:500] + "..." if resume_context else "No resume context provided."
+
+    user_prompt = f"""
+    Question: {question}
+    Candidate's Answer: {answer}
+    Resume Context: {resume_snippet}
+    Rate the relevance of this answer to the question on a scale of 0-100:
+    - 0-20: Completely off-topic or irrelevant
+    - 21-40: Tangentially related but misses the main point
+    - 41-60: Partially relevant but lacking specificity or completeness
+    - 61-80: Mostly relevant with minor diversions or gaps
+    - 81-100: Highly relevant, directly addresses the question with specificity
+    Return your evaluation as a JSON object with the following format:
+    {{
+    "relevance_score": [0-100 integer],
+    "feedback": "Brief explanation for the score (1-2 sentences)",
+    "strengths": ["List of 1-3 strengths"],
+    "areas_for_improvement": ["List of 1-3 areas for improvement"]
+    }}
+    """
+
+    try:
+        response = infer_with_retry([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ])
+
+        # Basic string to dict conversion since we can't import json
+        evaluation = eval(response.replace("null", "None").replace("true", "True").replace("false", "False"))
+
+         # --- Add BLEU Score Calculation ---
+        try:
+            reference = question.split()  # Tokenize question (reference)
+            candidate = answer.split()  # Tokenize answer (candidate)
+            bleu_score = sentence_bleu([reference], candidate)
+            evaluation["bleu_score"] = bleu_score
+        except Exception as bleu_err:
+            print(f"Error calculating BLEU score: {bleu_err}")
+            evaluation["bleu_score"] = None  # Or a default value like -1
+
+        # --- [Potentially Add Model Confidence Calculation Here] ---
+        #  Important: Inspect the 'response' from the Groq API. Does it contain any
+        #  confidence score or probability related to the relevance assessment?
+        #  If yes, extract it and add it to the 'evaluation' dictionary.
+        #  Example (replace with your actual confidence extraction logic):
+        #  if "confidence" in response:
+        #      evaluation["model_confidence"] = float(response["confidence"])
+        #  else:
+        #      evaluation["model_confidence"] = None
+        #  If the Groq API doesn't provide a confidence score, you can skip this section.
+        #  It's possible that the LLM is not designed to give a confidence score directly.
+        return evaluation
+
+    except Exception as e:
+        print(f"Error evaluating answer: {e}")
+        return {
+            "relevance_score": 0,
+            "feedback": "Error calculating score. Please check logs.",
+            "strengths": ["Unable to determine"],
+            "areas_for_improvement": ["Unable to determine"],
+            "bleu_score": None  # Added for consistency
+        }
+
+def evaluate_overall_interview(questions, answers, resume_text=""):
+    """
+    Evaluate the overall quality of an interview across all Q&A pairs.
+    Args:
+        questions (list): List of interview questions
+        answers (list): List of candidate answers
+        resume_text (str): Optional resume text for context
+    Returns:
+        dict: Overall evaluation with scores and feedback
+    """
+    if not questions or not answers or len(questions) != len(answers):
+        return {
+            "overall_score": 0,
+            "feedback": "Insufficient data for evaluation",
+            "question_scores": []
+        }
+
+    # Evaluate each individual answer
+    question_scores = []
+    for i, (question, answer) in enumerate(zip(questions, answers)):
+        score = calculate_relevance_score(question, answer, resume_text)
+        question_scores.append({
+            "question_number": i + 1,
+            "question": question,
+            "answer": answer,
+            "score": score
+        })
+        # Add a small delay to avoid API rate limits
+        time.sleep(0.5)
+
+    # Calculate overall score (weighted average of individual scores)
+    #added check to see if relevance score is in the keys, otherwise set to 50
+    overall_score = sum(qs["score"].get("relevance_score", 50) for qs in question_scores) / len(question_scores)
+
+    # Generate overall feedback
+    system_prompt = """
+    You are an expert interview evaluator. Synthesize the results of multiple
+    interview question evaluations into an overall assessment.
+    """
+    user_prompt = f"""
+    Based on these individual question evaluations:
+    {question_scores}
+    The candidate's overall relevance score is: {overall_score:.1f}/100
+    Provide an overall assessment that:
+    1. Summarizes general interview performance in terms of relevance
+    2. Identifies consistent strengths across answers
+    3. Identifies consistent areas for improvement
+    4. Provides 2-3 actionable recommendations for future interviews
+    Return your evaluation as a JSON object with the following format:
+    {{
+    "overall_assessment": "2-3 sentences on overall performance",
+    "consistent_strengths": ["List of 2-3 consistent strengths"],
+    "consistent_areas_for_improvement": ["List of 2-3 consistent weaknesses"],
+    "recommendations": ["List of 2-3 actionable recommendations"]
+    }}
+    """
+
+    try:
+        response = infer_with_retry([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ])
+
+        # Basic string to dict conversion
+        overall_feedback = eval(response.replace("null", "None").replace("true", "True").replace("false", "False"))
+        return {
+            "overall_score": overall_score,
+            "feedback": overall_feedback,
+            "question_scores": question_scores
+        }
+
+    except Exception as e:
+        print(f"Error generating overall evaluation: {e}")
+        return {
+            "overall_score": overall_score,
+            "feedback": {
+                "overall_assessment": "Unable to generate detailed feedback due to an error.",
+                "consistent_strengths": [],
+                "consistent_areas_for_improvement": [],
+                "recommendations": ["Review individual question scores for more insights."]
+            },
+            "question_scores": question_scores
+        }
